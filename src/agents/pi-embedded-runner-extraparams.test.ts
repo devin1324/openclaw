@@ -138,9 +138,9 @@ describe("resolveExtraParams", () => {
 
 describe("applyExtraParamsToAgent", () => {
   function createOptionsCaptureAgent() {
-    const calls: Array<SimpleStreamOptions | undefined> = [];
+    const calls: Array<(SimpleStreamOptions & { openaiWsWarmup?: boolean }) | undefined> = [];
     const baseStreamFn: StreamFn = (_model, _context, options) => {
-      calls.push(options);
+      calls.push(options as (SimpleStreamOptions & { openaiWsWarmup?: boolean }) | undefined);
       return {} as ReturnType<StreamFn>;
     };
     return {
@@ -317,6 +317,38 @@ describe("applyExtraParamsToAgent", () => {
     expect(payloads[0]).toEqual({ reasoning: { max_tokens: 256 } });
   });
 
+  it("does not inject reasoning.effort for x-ai/grok models on OpenRouter (#32039)", () => {
+    const payloads: Record<string, unknown>[] = [];
+    const baseStreamFn: StreamFn = (_model, _context, options) => {
+      const payload: Record<string, unknown> = {};
+      options?.onPayload?.(payload);
+      payloads.push(payload);
+      return {} as ReturnType<StreamFn>;
+    };
+    const agent = { streamFn: baseStreamFn };
+
+    applyExtraParamsToAgent(
+      agent,
+      undefined,
+      "openrouter",
+      "x-ai/grok-4.1-fast",
+      undefined,
+      "medium",
+    );
+
+    const model = {
+      api: "openai-completions",
+      provider: "openrouter",
+      id: "x-ai/grok-4.1-fast",
+    } as Model<"openai-completions">;
+    const context: Context = { messages: [] };
+    void agent.streamFn?.(model, context, {});
+
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]).not.toHaveProperty("reasoning");
+    expect(payloads[0]).not.toHaveProperty("reasoning_effort");
+  });
+
   it("normalizes thinking=off to null for SiliconFlow Pro models", () => {
     const payloads: Record<string, unknown>[] = [];
     const baseStreamFn: StreamFn = (_model, _context, options) => {
@@ -331,7 +363,7 @@ describe("applyExtraParamsToAgent", () => {
       agent,
       undefined,
       "siliconflow",
-      "Pro/MiniMaxAI/MiniMax-M2.1",
+      "Pro/MiniMaxAI/MiniMax-M2.5",
       undefined,
       "off",
     );
@@ -339,7 +371,7 @@ describe("applyExtraParamsToAgent", () => {
     const model = {
       api: "openai-completions",
       provider: "siliconflow",
-      id: "Pro/MiniMaxAI/MiniMax-M2.1",
+      id: "Pro/MiniMaxAI/MiniMax-M2.5",
     } as Model<"openai-completions">;
     const context: Context = { messages: [] };
     void agent.streamFn?.(model, context, {});
@@ -377,6 +409,202 @@ describe("applyExtraParamsToAgent", () => {
 
     expect(payloads).toHaveLength(1);
     expect(payloads[0]?.thinking).toBe("off");
+  });
+
+  it("maps thinkingLevel=off to Moonshot thinking.type=disabled", () => {
+    const payloads: Record<string, unknown>[] = [];
+    const baseStreamFn: StreamFn = (_model, _context, options) => {
+      const payload: Record<string, unknown> = {};
+      options?.onPayload?.(payload);
+      payloads.push(payload);
+      return {} as ReturnType<StreamFn>;
+    };
+    const agent = { streamFn: baseStreamFn };
+
+    applyExtraParamsToAgent(agent, undefined, "moonshot", "kimi-k2.5", undefined, "off");
+
+    const model = {
+      api: "openai-completions",
+      provider: "moonshot",
+      id: "kimi-k2.5",
+    } as Model<"openai-completions">;
+    const context: Context = { messages: [] };
+    void agent.streamFn?.(model, context, {});
+
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.thinking).toEqual({ type: "disabled" });
+  });
+
+  it("maps non-off thinking levels to Moonshot thinking.type=enabled and normalizes tool_choice", () => {
+    const payloads: Record<string, unknown>[] = [];
+    const baseStreamFn: StreamFn = (_model, _context, options) => {
+      const payload: Record<string, unknown> = { tool_choice: "required" };
+      options?.onPayload?.(payload);
+      payloads.push(payload);
+      return {} as ReturnType<StreamFn>;
+    };
+    const agent = { streamFn: baseStreamFn };
+
+    applyExtraParamsToAgent(agent, undefined, "moonshot", "kimi-k2.5", undefined, "low");
+
+    const model = {
+      api: "openai-completions",
+      provider: "moonshot",
+      id: "kimi-k2.5",
+    } as Model<"openai-completions">;
+    const context: Context = { messages: [] };
+    void agent.streamFn?.(model, context, {});
+
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.thinking).toEqual({ type: "enabled" });
+    expect(payloads[0]?.tool_choice).toBe("auto");
+  });
+
+  it("respects explicit Moonshot thinking param from model config", () => {
+    const payloads: Record<string, unknown>[] = [];
+    const baseStreamFn: StreamFn = (_model, _context, options) => {
+      const payload: Record<string, unknown> = {};
+      options?.onPayload?.(payload);
+      payloads.push(payload);
+      return {} as ReturnType<StreamFn>;
+    };
+    const agent = { streamFn: baseStreamFn };
+    const cfg = {
+      agents: {
+        defaults: {
+          models: {
+            "moonshot/kimi-k2.5": {
+              params: {
+                thinking: { type: "disabled" },
+              },
+            },
+          },
+        },
+      },
+    };
+
+    applyExtraParamsToAgent(agent, cfg, "moonshot", "kimi-k2.5", undefined, "high");
+
+    const model = {
+      api: "openai-completions",
+      provider: "moonshot",
+      id: "kimi-k2.5",
+    } as Model<"openai-completions">;
+    const context: Context = { messages: [] };
+    void agent.streamFn?.(model, context, {});
+
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.thinking).toEqual({ type: "disabled" });
+  });
+
+  it("normalizes kimi-coding anthropic tools to OpenAI function format", () => {
+    const payloads: Record<string, unknown>[] = [];
+    const baseStreamFn: StreamFn = (_model, _context, options) => {
+      const payload: Record<string, unknown> = {
+        tools: [
+          {
+            name: "read",
+            description: "Read file",
+            input_schema: {
+              type: "object",
+              properties: { path: { type: "string" } },
+              required: ["path"],
+            },
+          },
+          {
+            type: "function",
+            function: {
+              name: "exec",
+              description: "Run command",
+              parameters: { type: "object", properties: {} },
+            },
+          },
+        ],
+        tool_choice: { type: "tool", name: "read" },
+      };
+      options?.onPayload?.(payload);
+      payloads.push(payload);
+      return {} as ReturnType<StreamFn>;
+    };
+    const agent = { streamFn: baseStreamFn };
+
+    applyExtraParamsToAgent(agent, undefined, "kimi-coding", "k2p5", undefined, "low");
+
+    const model = {
+      api: "anthropic-messages",
+      provider: "kimi-coding",
+      id: "k2p5",
+      baseUrl: "https://api.kimi.com/coding/",
+    } as Model<"anthropic-messages">;
+    const context: Context = { messages: [] };
+    void agent.streamFn?.(model, context, {});
+
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.tools).toEqual([
+      {
+        type: "function",
+        function: {
+          name: "read",
+          description: "Read file",
+          parameters: {
+            type: "object",
+            properties: { path: { type: "string" } },
+            required: ["path"],
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "exec",
+          description: "Run command",
+          parameters: { type: "object", properties: {} },
+        },
+      },
+    ]);
+    expect(payloads[0]?.tool_choice).toEqual({
+      type: "function",
+      function: { name: "read" },
+    });
+  });
+
+  it("does not rewrite anthropic tool schema for non-kimi endpoints", () => {
+    const payloads: Record<string, unknown>[] = [];
+    const baseStreamFn: StreamFn = (_model, _context, options) => {
+      const payload: Record<string, unknown> = {
+        tools: [
+          {
+            name: "read",
+            description: "Read file",
+            input_schema: { type: "object", properties: {} },
+          },
+        ],
+      };
+      options?.onPayload?.(payload);
+      payloads.push(payload);
+      return {} as ReturnType<StreamFn>;
+    };
+    const agent = { streamFn: baseStreamFn };
+
+    applyExtraParamsToAgent(agent, undefined, "anthropic", "claude-sonnet-4-6", undefined, "low");
+
+    const model = {
+      api: "anthropic-messages",
+      provider: "anthropic",
+      id: "claude-sonnet-4-6",
+      baseUrl: "https://api.anthropic.com",
+    } as Model<"anthropic-messages">;
+    const context: Context = { messages: [] };
+    void agent.streamFn?.(model, context, {});
+
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.tools).toEqual([
+      {
+        name: "read",
+        description: "Read file",
+        input_schema: { type: "object", properties: {} },
+      },
+    ]);
   });
 
   it("removes invalid negative Google thinkingBudget and maps Gemini 3.1 to thinkingLevel", () => {
@@ -544,7 +772,7 @@ describe("applyExtraParamsToAgent", () => {
     expect(calls[0]?.transport).toBe("auto");
   });
 
-  it("does not set transport defaults for non-Codex providers", () => {
+  it("defaults OpenAI transport to auto (WebSocket-first)", () => {
     const { calls, agent } = createOptionsCaptureAgent();
 
     applyExtraParamsToAgent(agent, undefined, "openai", "gpt-5");
@@ -558,7 +786,87 @@ describe("applyExtraParamsToAgent", () => {
     void agent.streamFn?.(model, context, {});
 
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.transport).toBeUndefined();
+    expect(calls[0]?.transport).toBe("auto");
+    expect(calls[0]?.openaiWsWarmup).toBe(true);
+  });
+
+  it("lets runtime options override OpenAI default transport", () => {
+    const { calls, agent } = createOptionsCaptureAgent();
+
+    applyExtraParamsToAgent(agent, undefined, "openai", "gpt-5");
+
+    const model = {
+      api: "openai-responses",
+      provider: "openai",
+      id: "gpt-5",
+    } as Model<"openai-responses">;
+    const context: Context = { messages: [] };
+    void agent.streamFn?.(model, context, { transport: "sse" });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.transport).toBe("sse");
+  });
+
+  it("allows disabling OpenAI websocket warm-up via model params", () => {
+    const { calls, agent } = createOptionsCaptureAgent();
+    const cfg = {
+      agents: {
+        defaults: {
+          models: {
+            "openai/gpt-5": {
+              params: {
+                openaiWsWarmup: false,
+              },
+            },
+          },
+        },
+      },
+    };
+
+    applyExtraParamsToAgent(agent, cfg, "openai", "gpt-5");
+
+    const model = {
+      api: "openai-responses",
+      provider: "openai",
+      id: "gpt-5",
+    } as Model<"openai-responses">;
+    const context: Context = { messages: [] };
+    void agent.streamFn?.(model, context, {});
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.openaiWsWarmup).toBe(false);
+  });
+
+  it("lets runtime options override configured OpenAI websocket warm-up", () => {
+    const { calls, agent } = createOptionsCaptureAgent();
+    const cfg = {
+      agents: {
+        defaults: {
+          models: {
+            "openai/gpt-5": {
+              params: {
+                openaiWsWarmup: false,
+              },
+            },
+          },
+        },
+      },
+    };
+
+    applyExtraParamsToAgent(agent, cfg, "openai", "gpt-5");
+
+    const model = {
+      api: "openai-responses",
+      provider: "openai",
+      id: "gpt-5",
+    } as Model<"openai-responses">;
+    const context: Context = { messages: [] };
+    void agent.streamFn?.(model, context, {
+      openaiWsWarmup: true,
+    } as unknown as SimpleStreamOptions);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.openaiWsWarmup).toBe(true);
   });
 
   it("allows forcing Codex transport to SSE", () => {
@@ -746,6 +1054,19 @@ describe("applyExtraParamsToAgent", () => {
     });
   });
 
+  it("does not add Anthropic 1M beta header when context1m is not enabled", () => {
+    const cfg = buildAnthropicModelConfig("anthropic/claude-opus-4-6", {
+      temperature: 0.2,
+    });
+    const headers = runAnthropicHeaderCase({
+      cfg,
+      modelId: "claude-opus-4-6",
+      options: { headers: { "X-Custom": "1" } },
+    });
+
+    expect(headers).toEqual({ "X-Custom": "1" });
+  });
+
   it("skips context1m beta for OAuth tokens but preserves OAuth-required betas", () => {
     const calls: Array<SimpleStreamOptions | undefined> = [];
     const baseStreamFn: StreamFn = (_model, _context, options) => {
@@ -829,7 +1150,7 @@ describe("applyExtraParamsToAgent", () => {
         provider: "openai",
         id: "gpt-5",
         baseUrl: "https://api.openai.com/v1",
-      } as Model<"openai-responses">,
+      } as unknown as Model<"openai-responses">,
     });
     expect(payload.store).toBe(true);
   });
@@ -843,7 +1164,7 @@ describe("applyExtraParamsToAgent", () => {
         provider: "openai",
         id: "gpt-5",
         baseUrl: "https://proxy.example.com/v1",
-      } as Model<"openai-responses">,
+      } as unknown as Model<"openai-responses">,
     });
     expect(payload.store).toBe(false);
   });
@@ -857,7 +1178,7 @@ describe("applyExtraParamsToAgent", () => {
         provider: "openai",
         id: "gpt-5",
         baseUrl: "",
-      } as Model<"openai-responses">,
+      } as unknown as Model<"openai-responses">,
     });
     expect(payload.store).toBe(false);
   });
@@ -878,7 +1199,7 @@ describe("applyExtraParamsToAgent", () => {
         contextWindow: 128_000,
         maxTokens: 16_384,
         compat: { supportsStore: false },
-      } as Model<"openai-responses"> & { compat?: { supportsStore?: boolean } },
+      } as unknown as Model<"openai-responses">,
     });
     expect(payload.store).toBe(false);
   });
@@ -893,7 +1214,7 @@ describe("applyExtraParamsToAgent", () => {
         id: "gpt-5",
         baseUrl: "https://api.openai.com/v1",
         contextWindow: 200_000,
-      } as Model<"openai-responses">,
+      } as unknown as Model<"openai-responses">,
     });
     expect(payload.context_management).toEqual([
       {
@@ -912,7 +1233,7 @@ describe("applyExtraParamsToAgent", () => {
         provider: "azure-openai-responses",
         id: "gpt-4o",
         baseUrl: "https://example.openai.azure.com/openai/v1",
-      } as Model<"openai-responses">,
+      } as unknown as Model<"openai-responses">,
     });
     expect(payload).not.toHaveProperty("context_management");
   });
@@ -940,7 +1261,7 @@ describe("applyExtraParamsToAgent", () => {
         provider: "azure-openai-responses",
         id: "gpt-4o",
         baseUrl: "https://example.openai.azure.com/openai/v1",
-      } as Model<"openai-responses">,
+      } as unknown as Model<"openai-responses">,
     });
     expect(payload.context_management).toEqual([
       {
@@ -959,7 +1280,7 @@ describe("applyExtraParamsToAgent", () => {
         provider: "openai",
         id: "gpt-5",
         baseUrl: "https://api.openai.com/v1",
-      } as Model<"openai-responses">,
+      } as unknown as Model<"openai-responses">,
       payload: {
         store: false,
         context_management: [{ type: "compaction", compact_threshold: 12_345 }],
@@ -990,7 +1311,7 @@ describe("applyExtraParamsToAgent", () => {
         provider: "openai",
         id: "gpt-5",
         baseUrl: "https://api.openai.com/v1",
-      } as Model<"openai-responses">,
+      } as unknown as Model<"openai-responses">,
     });
     expect(payload).not.toHaveProperty("context_management");
   });
